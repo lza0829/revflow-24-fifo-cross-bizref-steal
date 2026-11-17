@@ -27,6 +27,7 @@ def test_settle_rolls_back_everything_on_failure(client, monkeypatch):
     before_accounts = client.get("/api/accounts").json()
     before_q = client.get("/api/quarantine").json()
     before_alloc = client.get("/api/match-allocations").json()
+    before_proofs = client.get("/api/allocation-proofs").json()
     before_runs = client.get("/api/settle-runs").json()
 
     def boom(conn, run_id):
@@ -39,6 +40,7 @@ def test_settle_rolls_back_everything_on_failure(client, monkeypatch):
 
     # 占用、隔离、流水状态、余额、归并运行均不得残留
     assert client.get("/api/match-allocations").json() == before_alloc
+    assert client.get("/api/allocation-proofs").json() == before_proofs
     assert client.get("/api/quarantine").json() == before_q
     assert client.get("/api/settle-runs").json() == before_runs
     after_entries = client.get("/api/entries").json()

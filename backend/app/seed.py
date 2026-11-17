@@ -57,6 +57,25 @@ CREATE INDEX IF NOT EXISTS idx_match_alloc_reversal
   ON match_allocations(reversal_entry_id);
 CREATE INDEX IF NOT EXISTS idx_match_alloc_run
   ON match_allocations(settle_run_id);
+CREATE TABLE IF NOT EXISTS allocation_proofs (
+  id INTEGER PRIMARY KEY,
+  settle_run_id INTEGER NOT NULL REFERENCES settle_runs(id),
+  reversal_entry_id INTEGER NOT NULL,
+  reversal_entry_key TEXT NOT NULL,
+  biz_ref TEXT NOT NULL DEFAULT '',
+  forward_entry_id INTEGER,
+  forward_entry_key TEXT NOT NULL DEFAULT '',
+  ordered_key TEXT NOT NULL DEFAULT '',
+  fifo_rank INTEGER NOT NULL DEFAULT 0,
+  allocated_cents INTEGER NOT NULL DEFAULT 0,
+  outcome TEXT NOT NULL,
+  failure_reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alloc_proof_run
+  ON allocation_proofs(settle_run_id);
+CREATE INDEX IF NOT EXISTS idx_alloc_proof_reversal
+  ON allocation_proofs(reversal_entry_id);
 CREATE TABLE IF NOT EXISTS settle_runs (
   id INTEGER PRIMARY KEY,
   status TEXT NOT NULL,

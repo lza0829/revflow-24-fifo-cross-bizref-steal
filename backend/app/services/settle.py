@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import json
+from contextlib import closing
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
 
 from app.db import connect, rows_to_dicts
-from app.modules.fifo_match import Exposure, allocate_fifo
+from app.modules.fifo_match import (
+    REASON_ACCOUNT_MISMATCH,
+    REASON_FIFO_SHORT,
+    REASON_NO_ORIGINAL,
+    AllocationPlan,
+    Exposure,
+    Pick,
+    plan_bizref_fifo,
+)
 
 
 def _now() -> str:
@@ -111,6 +120,9 @@ def list_entries(kind: str | None = None) -> list[dict]:
             r["entry_key"]: dict(r)
             for r in conn.execute("SELECT * FROM quarantine_items ORDER BY id").fetchall()
         }
+        proof_by_rev = {
+            p["冲正流水键"]: p for p in _list_allocation_proofs(conn, None)
+        }
 
         out: list[dict] = []
         for row in rows:
@@ -129,6 +141,7 @@ def list_entries(kind: str | None = None) -> list[dict]:
                 d["quarantine_reason"] = q["reason"] if q else None
                 d["fifo_short"] = bool(q and q["reason"] == "FIFO 不足")
                 d["quarantine_residual_cents"] = q["amount_cents"] if q else 0
+                d["allocation_proof"] = proof_by_rev.get(d["entry_key"])
             out.append(d)
         return out
 
@@ -161,6 +174,68 @@ def list_settle_runs() -> list[dict]:
         return rows_to_dicts(
             conn.execute("SELECT * FROM settle_runs ORDER BY id DESC").fetchall()
         )
+
+
+def list_allocation_proofs(
+    settle_run_id: int | None = None, conn=None
+) -> list[dict]:
+    """只读占用证明：按归并运行 id 查询，返回有序占用计划与失败原因。
+
+    每笔冲正一条证明；`占用` 为按 `fifo_rank` 排好的明细。
+    """
+    if conn is None:
+        with closing(connect()) as own:
+            return _list_allocation_proofs(own, settle_run_id)
+    return _list_allocation_proofs(conn, settle_run_id)
+
+
+def _list_allocation_proofs(conn, settle_run_id: int | None) -> list[dict]:
+    sql = """
+        SELECT p.*, a.code AS account_code, r.amount_cents AS reversal_amount_cents
+        FROM allocation_proofs p
+        JOIN ledger_entries r ON r.id = p.reversal_entry_id
+        JOIN accounts a ON a.id = r.account_id
+    """
+    params: tuple = ()
+    if settle_run_id is not None:
+        sql += " WHERE p.settle_run_id = ?"
+        params = (settle_run_id,)
+    sql += " ORDER BY p.settle_run_id, p.reversal_entry_id, p.fifo_rank, p.id"
+    rows = rows_to_dicts(conn.execute(sql, params).fetchall())
+
+    groups: dict[tuple[int, int], dict] = {}
+    out: list[dict] = []
+    for row in rows:
+        key = (row["settle_run_id"], row["reversal_entry_id"])
+        group = groups.get(key)
+        if group is None:
+            group = {
+                "证明#": row["id"],
+                "归并运行#": row["settle_run_id"],
+                "冲正流水键": row["reversal_entry_key"],
+                "账户": row["account_code"],
+                "业务单": row["biz_ref"],
+                "冲正金额分": row["reversal_amount_cents"],
+                "占用分": 0,
+                "失败原因": row["failure_reason"],
+                "结论": row["outcome"],
+                "时间": row["created_at"],
+                "占用": [],
+            }
+            groups[key] = group
+            out.append(group)
+        if row["forward_entry_id"] is None:
+            continue
+        group["占用"].append(
+            {
+                "正向流水键": row["forward_entry_key"],
+                "有序正向键": row["ordered_key"],
+                "FIFO 序": row["fifo_rank"],
+                "占用分": row["allocated_cents"],
+            }
+        )
+        group["占用分"] += row["allocated_cents"]
+    return out
 
 
 def list_match_allocations(settle_run_id: int | None = None) -> list[dict]:
@@ -239,6 +314,80 @@ def _insert_quarantine(
     )
 
 
+def _insert_proofs(
+    conn,
+    run_id: int,
+    now: str,
+    *,
+    reversal: dict,
+    picks: list[Pick],
+    residual: int,
+    failure_reason: str,
+) -> None:
+    """落占用证明：每步占用一行；失败/余分附失败原因，同挂本轮归并 id。
+
+    证明与 match_allocations 同事务写入，明细取自同一份有序占用计划，
+    因此界面读证明即可得到与占用、敞口、余额同源的分摊依据。
+    """
+    outcome = "失败" if not picks else ("部分占用" if residual > 0 else "占用")
+    for p in picks:
+        conn.execute(
+            """
+            INSERT INTO allocation_proofs(
+              settle_run_id, reversal_entry_id, reversal_entry_key, biz_ref,
+              forward_entry_id, forward_entry_key, ordered_key, fifo_rank,
+              allocated_cents, outcome, failure_reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                reversal["id"],
+                reversal["entry_key"],
+                reversal["biz_ref"] or "",
+                p.forward_entry_id,
+                p.forward_entry_key,
+                p.ordered_key,
+                p.fifo_rank,
+                p.cents,
+                outcome,
+                failure_reason,
+                now,
+            ),
+        )
+    if not picks:
+        conn.execute(
+            """
+            INSERT INTO allocation_proofs(
+              settle_run_id, reversal_entry_id, reversal_entry_key, biz_ref,
+              forward_entry_id, forward_entry_key, ordered_key, fifo_rank,
+              allocated_cents, outcome, failure_reason, created_at
+            ) VALUES (?, ?, ?, ?, NULL, '', '', 0, 0, ?, ?, ?)
+            """,
+            (
+                run_id,
+                reversal["id"],
+                reversal["entry_key"],
+                reversal["biz_ref"] or "",
+                outcome,
+                failure_reason or REASON_NO_ORIGINAL,
+                now,
+            ),
+        )
+
+
+def _no_pick_reason(reversal: dict, forwards: list[dict]) -> str:
+    """兜底失败原因：显式原单缺失按「冲正无原单」；否则按业务单跨账户判定。"""
+    if reversal["target_entry_key"]:
+        return REASON_NO_ORIGINAL
+    biz = reversal["biz_ref"] or ""
+    if biz and any(
+        f["account_id"] != reversal["account_id"] and (f["biz_ref"] or "") == biz
+        for f in forwards
+    ):
+        return REASON_ACCOUNT_MISMATCH
+    return REASON_NO_ORIGINAL
+
+
 def _recompute_balances(conn, run_id: int) -> int:
     """余额 = 正向量 − 占用总量（同源于 ledger_entries 与 match_allocations）。"""
     conn.execute(
@@ -293,7 +442,6 @@ def run_settle() -> dict:
             forwards = rows_to_dicts(
                 conn.execute("SELECT * FROM ledger_entries WHERE kind = '正向'").fetchall()
             )
-            fwd_by_key = {f["entry_key"]: f for f in forwards}
 
             allocated: dict[int, int] = {f["id"]: 0 for f in forwards}
             for row in conn.execute(
@@ -322,12 +470,26 @@ def run_settle() -> dict:
             run_forward_cents = sum(f["amount_cents"] for f in pending_forwards)
             run_allocated_cents = 0
 
+            def exposure_of(f: dict) -> Exposure:
+                return Exposure(
+                    entry_id=f["id"],
+                    entry_key=f["entry_key"],
+                    amount_cents=f["amount_cents"],
+                    allocated_cents=allocated.get(f["id"], 0),
+                    booked_at=f["booked_at"],
+                    account_id=f["account_id"],
+                    biz_ref=f["biz_ref"] or "",
+                )
+
+            # ---- 第一段：生成有序占用计划（纯内存，不落账） ----
+            plans: list[tuple[dict, list[dict], AllocationPlan]] = []
             for r in reversals:
-                existing = rows_to_dicts(
+                frozen_rows = rows_to_dicts(
                     conn.execute(
                         """
                         SELECT ma.forward_entry_id, ma.forward_entry_key,
-                               ma.allocated_cents, f.booked_at AS forward_booked_at
+                               ma.allocated_cents, f.booked_at AS forward_booked_at,
+                               f.biz_ref AS forward_biz_ref, f.account_id AS forward_account_id
                         FROM match_allocations ma
                         JOIN ledger_entries f ON f.id = ma.forward_entry_id
                         WHERE ma.reversal_entry_id = ?
@@ -336,90 +498,51 @@ def run_settle() -> dict:
                         (r["id"],),
                     ).fetchall()
                 )
-
-                picks: list[tuple[int, str, int]] = []  # (正向 id, 正向键, 分)
-                frozen = bool(existing)
-                if frozen:
-                    picks = [
-                        (a["forward_entry_id"], a["forward_entry_key"], a["allocated_cents"])
-                        for a in existing
-                    ]
-                else:
-                    target = None
-                    if r["target_entry_key"]:
-                        target = fwd_by_key.get(r["target_entry_key"])
-                        if target and target["account_id"] != r["account_id"]:
-                            _insert_quarantine(
-                                conn,
-                                run_id,
-                                now,
-                                entry_key=r["entry_key"],
-                                account_id=r["account_id"],
-                                reason="冲正账户与原单不一致",
-                                amount_cents=r["amount_cents"],
-                                allocated_cents=0,
-                                detail={
-                                    "冲正流水键": r["entry_key"],
-                                    "冲正金额分": r["amount_cents"],
-                                    "已占用分": 0,
-                                    "未消化分": r["amount_cents"],
-                                    "占用": [],
-                                },
-                            )
-                            conn.execute(
-                                "UPDATE ledger_entries SET status = '已隔离', settle_run_id = ? WHERE id = ?",
-                                (run_id, r["id"]),
-                            )
-                            quarantined += 1
-                            continue
-
-                    need = r["amount_cents"]
-
-                    # 显式原单优先，但同样受剩余敞口约束
-                    if target:
-                        exp = Exposure(
-                            entry_id=target["id"],
-                            entry_key=target["entry_key"],
-                            amount_cents=target["amount_cents"],
-                            allocated_cents=allocated.get(target["id"], 0),
-                            booked_at=target["booked_at"],
+                if frozen_rows:
+                    # 已有物化占用：直接复用，不重算挑单；计划仅用于落证明与状态
+                    picks = tuple(
+                        Pick(
+                            forward_entry_id=a["forward_entry_id"],
+                            forward_entry_key=a["forward_entry_key"],
+                            forward_biz_ref=a["forward_biz_ref"] or "",
+                            ordered_key=f"{a['forward_booked_at']}#{a['forward_entry_id']:06d}",
+                            fifo_rank=i,
+                            cents=a["allocated_cents"],
                         )
-                        take = min(exp.remaining_cents, need)
-                        if take > 0:
-                            picks.append((target["id"], target["entry_key"], take))
-                            need -= take
+                        for i, a in enumerate(frozen_rows, start=1)
+                    )
+                    matched = sum(p.cents for p in picks)
+                    plan = AllocationPlan(
+                        picks,
+                        matched,
+                        max(r["amount_cents"] - matched, 0),
+                        "" if matched >= r["amount_cents"] else REASON_FIFO_SHORT,
+                    )
+                else:
+                    snapshot = [exposure_of(f) for f in forwards]
+                    plan = plan_bizref_fifo(
+                        reversal_account_id=r["account_id"],
+                        reversal_biz_ref=r["biz_ref"] or "",
+                        amount_cents=r["amount_cents"],
+                        target_entry_key=r["target_entry_key"],
+                        exposures=snapshot,
+                    )
+                    # 计划内占用即时扣减敞口，后续冲正看到的是最新敞口
+                    for p in plan.picks:
+                        allocated[p.forward_entry_id] = (
+                            allocated.get(p.forward_entry_id, 0) + p.cents
+                        )
+                plans.append((r, frozen_rows, plan))
 
-                    # 缺口按同账户、同业务单 FIFO 补足
-                    if need > 0:
-                        refs = {r["biz_ref"]}
-                        if target:
-                            refs.add(target["biz_ref"])
-                        refs.discard("")
-                        exclude_id = target["id"] if target else None
-                        cands = [
-                            Exposure(
-                                entry_id=f["id"],
-                                entry_key=f["entry_key"],
-                                amount_cents=f["amount_cents"],
-                                allocated_cents=allocated.get(f["id"], 0),
-                                booked_at=f["booked_at"],
-                            )
-                            for f in forwards
-                            if f["id"] != exclude_id
-                            and allocated.get(f["id"], 0) < f["amount_cents"]
-                        ]
-                        fifo_picks, _ = allocate_fifo(cands, need)
-                        for exp, take in fifo_picks:
-                            picks.append((exp.entry_id, exp.entry_key, take))
-
-                matched = sum(p[2] for p in picks)
+            # ---- 第二段：一次性落占用、证明、隔离、状态与余额 ----
+            for r, frozen_rows, plan in plans:
+                frozen = bool(frozen_rows)
+                picks = list(plan.picks)
+                matched = plan.allocated_cents
                 residual = max(r["amount_cents"] - matched, 0)
-                alloc_detail = [
-                    {"正向流水键": key, "分摊分": cents} for _, key, cents in picks
-                ]
 
                 if not frozen:
-                    for fwd_id, fwd_key, cents in picks:
+                    for p in picks:
                         conn.execute(
                             """
                             INSERT INTO match_allocations(
@@ -428,27 +551,45 @@ def run_settle() -> dict:
                               allocated_cents, settle_run_id, created_at
                             ) VALUES (?, ?, ?, ?, ?, ?, ?)
                             """,
-                            (r["id"], r["entry_key"], fwd_id, fwd_key, cents, run_id, now),
+                            (
+                                r["id"],
+                                r["entry_key"],
+                                p.forward_entry_id,
+                                p.forward_entry_key,
+                                p.cents,
+                                run_id,
+                                now,
+                            ),
                         )
-                        allocated[fwd_id] = allocated.get(fwd_id, 0) + cents
                     run_allocated_cents += matched
+                    # 证明只记本轮真正落的占用，保证「证明占用 = 本轮占用表」恒等
+                    _insert_proofs(
+                        conn,
+                        run_id,
+                        now,
+                        reversal=r,
+                        picks=picks,
+                        residual=residual,
+                        failure_reason=plan.failure_reason,
+                    )
 
-                if matched > 0:
+                alloc_detail = [
+                    {"正向流水键": p.forward_entry_key, "分摊分": p.cents} for p in picks
+                ]
+
+                if matched <= 0:
+                    status = "已隔离"
+                    reason = plan.failure_reason or _no_pick_reason(r, forwards)
+                elif residual > 0:
+                    status = "部分归并"
+                    reason = plan.failure_reason or REASON_FIFO_SHORT
+                    partial += 1
+                else:
                     status = "已归并"
                     reason = None
                     settled += 1
-                else:
-                    status = "已隔离"
-                    if target:
-                        reason = "冲正超额"
-                    else:
-                        cross_account = bool(r["biz_ref"]) and any(
-                            f["account_id"] != r["account_id"] and f["biz_ref"] == r["biz_ref"]
-                            for f in forwards
-                        )
-                        reason = "冲正账户与原单不一致" if cross_account else "冲正无原单"
 
-                if residual > 0 and matched <= 0:
+                if residual > 0:
                     before = conn.execute(
                         "SELECT COUNT(*) AS c FROM quarantine_items WHERE entry_key = ?",
                         (r["entry_key"],),
@@ -464,6 +605,7 @@ def run_settle() -> dict:
                         allocated_cents=matched,
                         detail={
                             "冲正流水键": r["entry_key"],
+                            "业务单": r["biz_ref"],
                             "冲正金额分": r["amount_cents"],
                             "已占用分": matched,
                             "未消化分": residual,
@@ -478,7 +620,7 @@ def run_settle() -> dict:
 
                 conn.execute(
                     "UPDATE ledger_entries SET status = ?, settle_run_id = ? WHERE id = ?",
-                    (status if matched > 0 else status, run_id, r["id"]),
+                    (status, run_id, r["id"]),
                 )
 
             for f in pending_forwards:
@@ -667,6 +809,38 @@ def run_verify(settle_run_id: int | None = None) -> dict:
         balance_identity_ok = fwd_total - alloc_total == balance_sum
         exposure_identity_ok = fwd_total - alloc_total == exposure_remaining
 
+        proofs = _list_allocation_proofs(conn, settle_run_id)
+        proof_by_key = {p["冲正流水键"]: p for p in proofs}
+        proof_total = sum(p["占用分"] for p in proofs)
+        run_alloc_total = sum(
+            a["allocated_cents"] for a in alloc_rows if a["settle_run_id"] == settle_run_id
+        )
+        proof_vs_table_ok = proof_total == run_alloc_total
+        # 证明里的每步占用都必须落在同账户、同业务单的正向上
+        proof_same_biz_ok = True
+        proof_order_ok = True
+        fwd_by_key = {f["正向流水键"]: f for f in exposures}
+        rev_by_key = {r["entry_key"]: r for r in run_reversals}
+        for p in proofs:
+            rev = rev_by_key.get(p["冲正流水键"])
+            for step in p["占用"]:
+                f = fwd_by_key.get(step["正向流水键"])
+                if (
+                    rev is None
+                    or f is None
+                    or f["账户"] != rev["account_code"]
+                    or (f["业务单"] or "") != (p["业务单"] or "")
+                ):
+                    proof_same_biz_ok = False
+            ranks = [s["FIFO 序"] for s in p["占用"]]
+            if ranks != list(range(1, len(ranks) + 1)):
+                proof_order_ok = False
+        # 占用表每笔冲正的占用顺序也必须是 FIFO
+        for rev_id, allocs in alloc_by_rev.items():
+            keys = [(a["forward_booked_at"], a["forward_entry_id"]) for a in allocs]
+            if keys != sorted(keys):
+                proof_order_ok = False
+
         run_q_count = conn.execute(
             "SELECT COUNT(*) AS c FROM quarantine_items WHERE settle_run_id = ?",
             (settle_run_id,),
@@ -679,6 +853,9 @@ def run_verify(settle_run_id: int | None = None) -> dict:
             "敞口=正向-占用": exposure_identity_ok,
             "部分冲正隔离闭环": partial_closure_ok,
             "报告占用=占用表": report_vs_table_ok,
+            "占用证明=占用表": proof_vs_table_ok,
+            "占用证明同单同户": proof_same_biz_ok,
+            "占用严格 FIFO": proof_order_ok,
         }
         consistent = 1 if all(checks.values()) else 0
 
@@ -688,13 +865,12 @@ def run_verify(settle_run_id: int | None = None) -> dict:
             "全量流水净额分": fwd_total - alloc_total,
             "全量账户余额分": balance_sum,
             "全量剩余敞口分": exposure_remaining,
-            "本轮冲正占用分": sum(
-                a["allocated_cents"] for a in alloc_rows if a["settle_run_id"] == settle_run_id
-            ),
+            "本轮冲正占用分": run_alloc_total,
             "本轮隔离数": run_q_count,
             "校验": checks,
             "每笔冲正占用": reversal_detail,
             "正向敞口": exposures,
+            "占用证明": proofs,
         }
         now = _now()
         cur = conn.execute(

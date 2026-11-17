@@ -30,7 +30,7 @@ function statusClass(status) {
     <h1>冲正流水</h1>
     <p class="lead">
       冲正优先关联原正向流水键；只带业务单的冲正按同账户、同业务单的入账时间 FIFO 占用，
-      占用结果落到匹配占用表，后续归并只认该占用。
+      占用结果落到匹配占用表，后续归并只认该占用。跨单或跳号按失败闭处理，不落占用、不动余额。
     </p>
     <p v-if="err" class="msg">{{ err }}</p>
     <div class="panel">
@@ -51,11 +51,28 @@ function statusClass(status) {
                 <code>{{ e.target_entry_key }}</code>
                 <span class="muted">（显式原单）</span>
               </div>
-              <div v-for="a in e.allocations" :key="a.id" class="alloc-line">
-                <code>{{ a.forward_entry_key }}</code>
-                <span class="split">+{{ yuan(a.allocated_cents) }}</span>
-              </div>
-              <span v-if="!e.target_entry_key && !e.allocations.length" class="muted">—</span>
+              <template v-if="e.allocation_proof?.占用?.length">
+                <div
+                  v-for="s in e.allocation_proof['占用']"
+                  :key="s['正向流水键'] + s['FIFO 序']"
+                  class="alloc-line"
+                >
+                  <span class="rank">#{{ s['FIFO 序'] }}</span>
+                  <code>{{ s['正向流水键'] }}</code>
+                  <span class="split">+{{ yuan(s['占用分']) }}</span>
+                  <span class="ordered">{{ s['有序正向键'] }}</span>
+                </div>
+              </template>
+              <template v-else>
+                <div v-for="a in e.allocations" :key="a.id" class="alloc-line">
+                  <code>{{ a.forward_entry_key }}</code>
+                  <span class="split">+{{ yuan(a.allocated_cents) }}</span>
+                </div>
+              </template>
+              <span
+                v-if="!e.target_entry_key && !e.allocations.length && !e.allocation_proof?.占用?.length"
+                class="muted"
+              >—</span>
               <div v-if="e.fifo_short" class="tag warn">FIFO 不足</div>
             </td>
             <td>{{ e.biz_ref }}</td>
@@ -68,6 +85,9 @@ function statusClass(status) {
               <span class="tag" :class="statusClass(e.status)">{{ e.status }}</span>
               <div v-if="e.quarantine_reason && e.status !== '已归并'" class="muted small">
                 {{ e.quarantine_reason }}
+              </div>
+              <div v-else-if="e.allocation_proof?.失败原因" class="muted small">
+                {{ e.allocation_proof['失败原因'] }}
               </div>
             </td>
           </tr>
@@ -86,6 +106,12 @@ function statusClass(status) {
   font-size: 12px;
 }
 .alloc-line code { color: var(--accent); }
+.rank {
+  color: var(--muted);
+  background: #eef2f7;
+  padding: 0 4px;
+}
+.ordered { color: var(--muted); font-size: 10.5px; }
 .split { color: var(--ok); }
 .muted { color: var(--muted); }
 .small { font-size: 11px; margin-top: 4px; }

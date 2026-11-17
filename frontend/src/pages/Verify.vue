@@ -145,6 +145,49 @@ const expandedReport = computed(() => rows.value.find((r) => r.id === expanded.v
         </tbody>
       </table>
 
+      <h3>占用证明</h3>
+      <p class="totals">
+        证明占用合计 {{ yuan((expandedReport.detail['占用证明'] || []).reduce((s, p) => s + p['占用分'], 0)) }}
+        ；失败闭 {{ (expandedReport.detail['占用证明'] || []).filter((p) => p['结论'] === '失败').length }} 笔
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>冲正流水键</th><th>业务单</th><th>冲正金额</th><th>占用分</th>
+            <th>有序占用（FIFO 序 · 正向键 · 有序正向键）</th><th>结论</th><th>失败原因</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="p in expandedReport.detail['占用证明'] || []" :key="p['证明#'] + p['冲正流水键']">
+            <td>{{ p['冲正流水键'] }}</td>
+            <td>{{ p['业务单'] || '—' }}</td>
+            <td>{{ yuan(p['冲正金额分']) }}</td>
+            <td>{{ yuan(p['占用分']) }}</td>
+            <td>
+              <div v-for="s in p['占用']" :key="s['有序正向键']" class="alloc-line">
+                <span class="rank">#{{ s['FIFO 序'] }}</span>
+                <code>{{ s['正向流水键'] }}</code>
+                <span class="split">+{{ yuan(s['占用分']) }}</span>
+                <span class="ordered">{{ s['有序正向键'] }}</span>
+              </div>
+              <span v-if="!p['占用'].length" class="muted">—</span>
+            </td>
+            <td>
+              <span class="tag" :class="{ on: p['结论'] === '占用', warn: p['结论'] === '部分占用', bad: p['结论'] === '失败' }">
+                {{ p['结论'] }}
+              </span>
+            </td>
+            <td>
+              <span v-if="p['失败原因']" class="muted small">{{ p['失败原因'] }}</span>
+              <span v-else class="muted">—</span>
+            </td>
+          </tr>
+          <tr v-if="!(expandedReport.detail['占用证明'] || []).length">
+            <td colspan="7">该轮无占用证明</td>
+          </tr>
+        </tbody>
+      </table>
+
       <h3>正向敞口</h3>
       <table>
         <thead>
@@ -198,6 +241,8 @@ h3 {
   font-size: 12px;
 }
 .alloc-line code { color: var(--accent); }
+.rank { color: var(--muted); background: #eef2f7; padding: 0 4px; }
+.ordered { color: var(--muted); font-size: 10.5px; }
 .split { color: var(--ok); }
 .muted { color: var(--muted); }
 .small { font-size: 10.5px; }

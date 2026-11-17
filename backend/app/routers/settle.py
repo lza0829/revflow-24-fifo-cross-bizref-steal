@@ -16,6 +16,12 @@ def get_allocations(settle_run_id: int | None = Query(None)):
     return svc.list_match_allocations(settle_run_id)
 
 
+@router.get("/allocation-proofs")
+def get_allocation_proofs(settle_run_id: int | None = Query(None)):
+    """只读占用证明：按归并运行 id 查询有序占用计划、占用分与失败原因。"""
+    return svc.list_allocation_proofs(settle_run_id)
+
+
 @router.get("/settle-runs/{run_id}")
 def get_run(run_id: int):
     return svc.get_settle_run(run_id)
