@@ -1,0 +1,15 @@
+{
+  "accounts": [
+    {"id": 1, "code": "ACC-零售-01", "name": "华东零售结算户", "currency": "CNY"}
+  ],
+  "forward_entries": [
+    {"id": 1, "entry_key": "FWD-BIZ-001", "account_id": 1, "amount_cents": 3000, "biz_ref": "ORD-B01", "booked_at": "2026-11-16T08:00:00Z", "note": "业务单首笔"},
+    {"id": 2, "entry_key": "FWD-BIZ-002", "account_id": 1, "amount_cents": 5000, "biz_ref": "ORD-B01", "booked_at": "2026-11-16T09:00:00Z", "note": "业务单次笔"},
+    {"id": 3, "entry_key": "FWD-BIZ-003", "account_id": 1, "amount_cents": 2000, "biz_ref": "ORD-B01", "booked_at": "2026-11-16T10:00:00Z", "note": "业务单末笔"},
+    {"id": 4, "entry_key": "FWD-BIZ-004", "account_id": 1, "amount_cents": 4000, "biz_ref": "ORD-B02", "booked_at": "2026-11-16T07:00:00Z", "note": "异业务单，同账户不参与"}
+  ],
+  "reversal_entries": [
+    {"entry_key": "REV-BIZ-001", "account_id": 1, "amount_cents": 6000, "biz_ref": "ORD-B01", "target_entry_key": null, "booked_at": "2026-11-16T12:00:00Z", "note": "只带业务单：跨两笔正向 FIFO"},
+    {"entry_key": "REV-BIZ-002", "account_id": 1, "amount_cents": 5000, "biz_ref": "ORD-B01", "target_entry_key": null, "booked_at": "2026-11-16T13:00:00Z", "note": "只带业务单：剩余敞口不足，部分隔离"}
+  ]
+}
